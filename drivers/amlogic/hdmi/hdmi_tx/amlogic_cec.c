@@ -36,7 +36,8 @@
 #include <mach/hdmi_tx_reg.h>
 #include <linux/amlogic/hdmi_tx/hdmi_tx_cec.h>
 
-#define CONFIG_TV_DEBUG
+#define CONFIG_TV_DEBUG // for verbose output
+#undef CONFIG_TV_DEBUG
 
 MODULE_AUTHOR("Gerald Dachs");
 MODULE_DESCRIPTION("Amlogic CEC driver");
@@ -86,6 +87,12 @@ struct cec_rx_struct {
 	struct list_head list;
 };
 
+struct cec_tx_struct {
+	spinlock_t lock;
+	wait_queue_head_t waitq;
+	atomic_t state;
+};
+
 enum cec_state {
 	STATE_RX,
 	STATE_TX,
@@ -97,6 +104,38 @@ static char banner[] __initdata =
     "Amlogic CEC Driver, (c) 2016 Gerald Dachs\n";
 
 static struct cec_rx_struct cec_rx_struct;
+
+static struct cec_tx_struct cec_tx_struct;
+
+#if MESON_CPU_TYPE == MESON_CPU_TYPE_MESON6
+static void meson6_cec_write(const char *data, size_t count)
+{
+  int i;
+  int pos;
+  unsigned char msg_log_buf[128] = { 0 };
+
+  for (i = 0; i < count; ++i)
+  {
+      hdmi_wr_reg(CEC0_BASE_ADDR+CEC_TX_MSG_0_HEADER + i, data[i]);
+  }
+  hdmi_wr_reg(CEC0_BASE_ADDR+CEC_TX_MSG_LENGTH, count - 1);
+  hdmi_wr_reg(CEC0_BASE_ADDR+CEC_TX_MSG_CMD, TX_REQ_CURRENT);
+
+  if (cec_msg_dbg_en  == 1)
+  {
+      pos = 0;
+      pos += sprintf(msg_log_buf + pos, "CEC: tx msg len: %d   dat: ", count);
+      for (i = 0; i < count; i++)
+      {
+          pos += sprintf(msg_log_buf + pos, "%02x ", data[i]);
+      }
+      pos += sprintf(msg_log_buf + pos, "\n");
+
+      msg_log_buf[pos] = '\0';
+      printk("%s", msg_log_buf);
+  }
+}
+#endif
 
 unsigned short cec_log_addr_to_dev_type(unsigned char log_addr)
 {
@@ -140,7 +179,12 @@ void cec_report_physical_address_smp(void)
     msg[3] = phy_addr_cd;
     msg[4] = cec_log_addr_to_dev_type(index);
 
+#if MESON_CPU_TYPE == MESON_CPU_TYPE_MESON6
+    meson6_cec_write(msg, 5);
+#endif
+#if MESON_CPU_TYPE >= MESON_CPU_TYPE_MESON8
     cec_ll_tx(msg, 5);
+#endif
 
     tvout_dbg("cec_report_physical_address_smp: leave\n");
 }
@@ -187,6 +231,11 @@ void cec_node_init(hdmitx_dev_t* hdmitx_device)
 static void amlogic_cec_set_rx_state(enum cec_state state)
 {
     atomic_set(&cec_rx_struct.state, state);
+}
+
+static void amlogic_cec_set_tx_state(enum cec_state state)
+{
+    atomic_set(&cec_tx_struct.state, state);
 }
 
 static int amlogic_cec_open(struct inode *inode, struct file *file)
@@ -268,10 +317,7 @@ error_exit:
 static ssize_t amlogic_cec_write(struct file *file, const char __user *buffer,
 			size_t count, loff_t *ppos)
 {
-    int ret = 0;
-
     char data[CEC_TX_BUFF_SIZE];
-
     tvout_dbg("amlogic_cec_write: enter\n");
 
     /* check data size */
@@ -284,11 +330,26 @@ static ssize_t amlogic_cec_write(struct file *file, const char __user *buffer,
 	return -EFAULT;
     }
 
-    ret = cec_ll_tx(data, count);
-    if (ret != 1)
+    amlogic_cec_set_tx_state(STATE_TX);
+
+#if MESON_CPU_TYPE == MESON_CPU_TYPE_MESON6
+    meson6_cec_write(data, count);
+#endif
+#if MESON_CPU_TYPE >= MESON_CPU_TYPE_MESON8
+    cec_ll_tx(data, count);
+#endif
+
+    if (wait_event_interruptible(cec_tx_struct.waitq,
+				 atomic_read(&cec_tx_struct.state) != STATE_TX))
     {
-    	tvout_dbg("Message transmit failed, ret=%d\n", ret);
-        return -1;
+	tvout_dbg("error during wait on state change\n");
+	return -ERESTARTSYS;
+    }
+
+    if (atomic_read(&cec_tx_struct.state) != STATE_DONE)
+    {
+	tvout_dbg("state != STATE_DONE\n");
+	return -1;
     }
 
     tvout_dbg("amlogic_cec_write: leave\n");
@@ -357,53 +418,73 @@ static irqreturn_t amlogic_cec_irq_handler(int irq, void *dummy)
 {
     unsigned long spin_flags;
     struct cec_rx_list *entry;
-#if MESON_CPU_TYPE >= MESON_CPU_TYPE_MESON8
-    unsigned int intr_stat = 0;
-#endif
+    unsigned int tx_msg_state;
+    unsigned int rx_msg_state;
 
     tvout_dbg("amlogic_cec_irq_handler: enter\n");
 
     udelay(100); //Delay execution a little. This fixes an issue when HDMI CEC stops working after a while.
 
 #if MESON_CPU_TYPE == MESON_CPU_TYPE_MESON6
-    tvout_dbg("cec TX status: rx: 0x%x; tx: 0x%x\n", hdmi_rd_reg(CEC0_BASE_ADDR+CEC_RX_MSG_STATUS), hdmi_rd_reg(CEC0_BASE_ADDR+CEC_TX_MSG_STATUS));
-    if (hdmi_rd_reg(CEC0_BASE_ADDR+CEC_RX_MSG_STATUS) != RX_DONE)
-    {
-        return IRQ_HANDLED;
-    }
+    tx_msg_state = hdmi_rd_reg(CEC0_BASE_ADDR+CEC_TX_MSG_STATUS);
+    rx_msg_state = hdmi_rd_reg(CEC0_BASE_ADDR+CEC_RX_MSG_STATUS);
 #endif
 
 #if MESON_CPU_TYPE >= MESON_CPU_TYPE_MESON8
-    intr_stat = aml_read_reg32(P_AO_CEC_INTR_STAT);
-    tvout_dbg("aocec irq %x\n", intr_stat);
-    if (intr_stat & (1<<1))
-    {   // aocec tx intr
-        tx_irq_handle();
-        return IRQ_HANDLED;
-    }
+    tx_msg_state = aocec_rd_reg(CEC_TX_MSG_STATUS);
+    rx_msg_state = aocec_rd_reg(CEC_RX_MSG_STATUS);
 #endif
 
-    if ((entry = kmalloc(sizeof(struct cec_rx_list), GFP_ATOMIC)) == NULL)
+    tvout_dbg("cec msg status: rx: 0x%x; tx: 0x%x\n", rx_msg_state, tx_msg_state);
+
+    if ((tx_msg_state == TX_DONE) || (tx_msg_state == TX_ERROR))
     {
-        tvout_dbg("can't alloc cec_rx_list\n");
-        return IRQ_HANDLED;
+#if MESON_CPU_TYPE == MESON_CPU_TYPE_MESON6
+        hdmi_wr_reg(CEC0_BASE_ADDR+CEC_TX_MSG_CMD, TX_NO_OP);
+#endif
+
+#if MESON_CPU_TYPE >= MESON_CPU_TYPE_MESON8
+        aocec_wr_reg(CEC_TX_MSG_CMD, TX_NO_OP);
+#endif
+	switch (tx_msg_state) {
+	  case TX_ERROR :
+	    amlogic_cec_set_tx_state(STATE_ERROR);
+	    break;
+	  case TX_DONE :
+	    amlogic_cec_set_tx_state(STATE_DONE);
+	    break;
+	  default :
+	    tvout_dbg("unexpected ts message state: 0x%x", tx_msg_state);
+	    break;
+	}
+	wake_up_interruptible(&cec_tx_struct.waitq);
     }
 
-    if ((-1) == cec_ll_rx(entry->buffer, &entry->size))
+    if (rx_msg_state == RX_DONE)
     {
-        kfree(entry);
-        tvout_dbg("amlogic_cec_irq_handler: nothing to read\n");
-        return IRQ_HANDLED;
+
+	if ((entry = kmalloc(sizeof(struct cec_rx_list), GFP_ATOMIC)) == NULL)
+	{
+	    tvout_dbg("can't alloc cec_rx_list\n");
+	    return IRQ_HANDLED;
+	}
+
+	if ((-1) == cec_ll_rx(entry->buffer, &entry->size))
+	{
+	    kfree(entry);
+	    tvout_dbg("amlogic_cec_irq_handler: nothing to read\n");
+	    return IRQ_HANDLED;
+	}
+
+	INIT_LIST_HEAD(&entry->list);
+
+	spin_lock_irqsave(&cec_rx_struct.lock, spin_flags);
+	list_add_tail(&entry->list, &cec_rx_struct.list);
+	amlogic_cec_set_rx_state(STATE_DONE);
+	spin_unlock_irqrestore(&cec_rx_struct.lock, spin_flags);
+
+	wake_up_interruptible(&cec_rx_struct.waitq);
     }
-
-    INIT_LIST_HEAD(&entry->list);
-
-    spin_lock_irqsave(&cec_rx_struct.lock, spin_flags);
-    list_add_tail(&entry->list, &cec_rx_struct.list);
-    amlogic_cec_set_rx_state(STATE_DONE);
-    spin_unlock_irqrestore(&cec_rx_struct.lock, spin_flags);
-
-    wake_up_interruptible(&cec_rx_struct.waitq);
 
     tvout_dbg("amlogic_cec_irq_handler: leave\n");
 
@@ -489,7 +570,12 @@ static int amlogic_cec_init(void)
 #endif
 
     init_waitqueue_head(&cec_rx_struct.waitq);
+
     spin_lock_init(&cec_rx_struct.lock);
+
+    init_waitqueue_head(&cec_tx_struct.waitq);
+
+    spin_lock_init(&cec_tx_struct.lock);
 
     if (misc_register(&cec_misc_device))
     {
